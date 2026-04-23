@@ -37,6 +37,7 @@ def format_response(engine_output: Dict[str, Any]) -> Dict[str, Any]:
             "cost_usd_monthly":   f["cost_usd_monthly"],
             "cost_inr_monthly":   f["cost_inr_monthly"],
             "carbon_kg_monthly":  f["carbon_kg_monthly"],
+            "is_throughput_degrader": f["rule_id"] == "R2", 
         })
 
     return {
