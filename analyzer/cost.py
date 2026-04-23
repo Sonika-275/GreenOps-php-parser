@@ -2,23 +2,23 @@
 cost.py
 AWS cost estimation for each rule/context.
 
-Each rule hits different AWS layers — costs are summed per layer.
+Target stack: Laravel on EC2 + RDS (ap-south-1)
+EC2 is always-on — no per-ms billing. Costs modelled only where
+a real AWS bill line exists.
 
 Constants (ap-south-1, 2024):
-  Lambda: $0.0000166667 per GB-second (128MB = 0.125 GB)
   RDS I/O: $0.20 per 1 million I/O requests
-  Data Transfer (cross-AZ): $0.01 per GB
-  Data Transfer (same-AZ): $0.00 (free)
+  Data Transfer (same-AZ, same-VPC, RDS→EC2): $0.00 (free)
 
-Assumptions documented per rule.
+Rules for what gets a cost vs a flag:
+  R1 (N+1)     → RDS I/O only (extra queries hit the DB)
+  R2 (count()) → $0 direct AWS cost; flagged as throughput degrader
+  R3 (SELECT*) → RDS I/O only (extra pages read); transfer is free same-AZ
 """
 
 # ── AWS Constants ────────────────────────────────────────────
-LAMBDA_COST_PER_GB_SEC   = 0.0000166667   # USD, ap-south-1
-LAMBDA_MEMORY_GB         = 0.125          # 128MB default function
-RDS_IO_COST_PER_MILLION  = 0.20           # USD per 1M I/O requests
-DATA_TRANSFER_PER_GB     = 0.01           # USD, cross-AZ RDS→Lambda
-DATA_TRANSFER_SAME_AZ    = 0.00           # Free
+RDS_IO_COST_PER_MILLION  = 0.20           # USD per 1M I/O requests, ap-south-1
+DATA_TRANSFER_SAME_AZ    = 0.00           # RDS→EC2 same-AZ, same-VPC: free
 
 # ── Workload Assumptions ──────────────────────────────────────
 DEFAULT_RUNS_PER_DAY     = 10_000
@@ -30,21 +30,11 @@ ASSUMED_N_ROWS           = 100   # rows in a typical foreach result
 ASSUMED_M_ROWS           = 50    # inner loop row count (nested)
 EXTRA_COLUMNS            = 20    # columns fetched unnecessarily (SELECT *)
 AVG_BYTES_PER_COLUMN     = 50    # bytes per extra column
-RDS_READ_SPEED_BYTES_SEC = 100 * 1024 * 1024   # 100 MB/s
 RDS_PAGE_SIZE_BYTES      = 8192  # 8KB per RDS I/O
-NETWORK_BANDWIDTH_BYTES  = 10 * 1024 * 1024 * 1024  # 10Gbps same-AZ
 PHP_OPS_PER_SEC          = 100_000_000  # PHP simple operations/second
 
 # Collection size assumed for count() recalculation
 ASSUMED_COLLECTION_SIZE  = 5_000
-
-
-def _lambda_cost(extra_ms: float, runs_per_day: int = DEFAULT_RUNS_PER_DAY) -> float:
-    """USD cost from extra Lambda execution time per month."""
-    extra_sec = extra_ms / 1000
-    gb_sec_per_call = LAMBDA_MEMORY_GB * extra_sec
-    monthly_calls = runs_per_day * DAYS_PER_MONTH
-    return gb_sec_per_call * monthly_calls * LAMBDA_COST_PER_GB_SEC
 
 
 def _rds_io_cost(extra_queries: int, runs_per_day: int = DEFAULT_RUNS_PER_DAY) -> float:
@@ -53,15 +43,9 @@ def _rds_io_cost(extra_queries: int, runs_per_day: int = DEFAULT_RUNS_PER_DAY) -
     return (monthly_extra_queries / 1_000_000) * RDS_IO_COST_PER_MILLION
 
 
-def _data_transfer_cost(extra_bytes: float, runs_per_day: int = DEFAULT_RUNS_PER_DAY) -> float:
-    """USD cost from extra data transfer RDS→Lambda (cross-AZ) per month."""
-    monthly_bytes = extra_bytes * runs_per_day * DAYS_PER_MONTH
-    monthly_gb = monthly_bytes / (1024 ** 3)
-    return monthly_gb * DATA_TRANSFER_PER_GB
-
-
 # ── Rule 1 — N+1 Query ───────────────────────────────────────
-# Layers: RDS I/O + Lambda execution time
+# Layers: RDS I/O only
+# EC2 execution time is absorbed into always-on instance cost — not billed per ms.
 # C1/C2: N+1 queries (N=100 rows) → 99 extra queries
 # C3:    N×M queries (N=100, M=50) → 4998 extra queries
 # C4:    Same as C1/C2 (hidden in function, same DB cost)
@@ -72,50 +56,35 @@ def rule1_cost(context: int, runs_per_day: int = DEFAULT_RUNS_PER_DAY) -> float:
     else:
         extra_queries = ASSUMED_N_ROWS - 1  # C1, C2, C4
 
-    extra_ms = extra_queries * DB_ROUND_TRIP_MS
-
-    rds   = _rds_io_cost(extra_queries, runs_per_day)
-    lam   = _lambda_cost(extra_ms, runs_per_day)
-    return round(rds + lam, 4)
+    rds = _rds_io_cost(extra_queries, runs_per_day)
+    return round(rds, 4)
 
 
 # ── Rule 2 — count() Recalculation ───────────────────────────
-# Layers: Lambda compute (CPU) only
-# No DB hit. Pure CPU waste.
-# count() on N-item collection called N times = N² ops
-# Optimized = N ops
-# Extra ops = N² - N ≈ N² for large N
+# Layers: none (pure PHP CPU on EC2 — no AWS bill line)
+# EC2 CPU is pre-paid 24/7. Redundant count() burns CPU that
+# could serve other requests → throughput degradation, not a bill line.
+# Cost returned as $0; callers should surface this as a performance flag.
 
 def rule2_cost(context: int, runs_per_day: int = DEFAULT_RUNS_PER_DAY) -> float:
-    N = ASSUMED_COLLECTION_SIZE
-    extra_ops = (N * N) - N   # N² - N
-    extra_sec = extra_ops / PHP_OPS_PER_SEC
-    extra_ms  = extra_sec * 1000
-
-    # C1 (for) and C2 (while) have identical CPU cost pattern
-    lam = _lambda_cost(extra_ms, runs_per_day)
-    return round(lam, 4)
+    # No direct AWS billing impact on EC2.
+    # Flag this as a throughput degrader in the rule metadata instead.
+    return 0.0
 
 
 # ── Rule 3 — SELECT * ─────────────────────────────────────────
-# Layers: RDS I/O + Data Transfer + Lambda (deserialize)
-# Extra bytes per row = EXTRA_COLUMNS × AVG_BYTES_PER_COLUMN = 1000 bytes
+# Layers: RDS I/O only
+# Data transfer RDS→EC2 is free within the same AZ/VPC.
+# EC2 deserialization of extra Eloquent columns is absorbed into instance cost.
 
 def _rule3_base_cost(row_count: int, runs_per_day: int) -> float:
     extra_bytes_per_call = row_count * EXTRA_COLUMNS * AVG_BYTES_PER_COLUMN
 
-    # RDS I/O — extra pages read
+    # RDS I/O — extra pages read due to wider rows
     extra_ios = max(1, extra_bytes_per_call // RDS_PAGE_SIZE_BYTES)
     rds = (extra_ios * runs_per_day * DAYS_PER_MONTH / 1_000_000) * RDS_IO_COST_PER_MILLION
 
-    # Data transfer (cross-AZ assumption — conservative)
-    transfer = _data_transfer_cost(extra_bytes_per_call, runs_per_day)
-
-    # Lambda deserialization — ~10ms per 100KB extra
-    deser_ms = (extra_bytes_per_call / (100 * 1024)) * 10
-    lam = _lambda_cost(deser_ms, runs_per_day)
-
-    return rds + transfer + lam
+    return rds
 
 
 def rule3_cost(context: int, runs_per_day: int = DEFAULT_RUNS_PER_DAY) -> float:
@@ -136,6 +105,9 @@ def estimate_cost(rule_id: str, context: int,
                   runs_per_day: int = DEFAULT_RUNS_PER_DAY) -> dict:
     """
     Returns monthly cost estimate in USD for a given rule/context.
+
+    R2 returns $0 — callers should check 'is_throughput_degrader'
+    and surface a performance warning instead of a cost tag.
     """
     if rule_id == "R1":
         usd = rule1_cost(context, runs_per_day)
@@ -150,5 +122,6 @@ def estimate_cost(rule_id: str, context: int,
         "cost_usd_monthly": usd,
         "cost_inr_monthly": round(usd * 84, 2),   # USD→INR approx rate
         "runs_per_day": runs_per_day,
-        "note": "Modelled estimate based on AWS ap-south-1 pricing. Actual cost varies.",
+        "is_throughput_degrader": rule_id == "R2",
+        "note": "Modelled on AWS ap-south-1 pricing (EC2+RDS, same-AZ). Actual cost varies.",
     }
