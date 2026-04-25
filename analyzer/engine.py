@@ -44,7 +44,7 @@ def analyze(source_code: str, runs_per_day: int = 10_000) -> dict:
     findings = []
     total_weight = 0
     total_carbon = 0.0
-    total_cost = 0.0
+    total_cost   = 0.0
 
     for f in findings_raw:
         cost_data   = estimate_cost(f["rule_id"], f["context"], runs_per_day)
@@ -55,17 +55,24 @@ def analyze(source_code: str, runs_per_day: int = 10_000) -> dict:
         total_cost   += cost_data["cost_usd_monthly"]
 
         findings.append({
-            "rule_id":            f["rule_id"],
-            "context":            f["context"],
-            "line":               f["line"],
-            "severity":           f["severity"],
-            "weight":             f["weight"],
-            "title":              f["title"],
-            "description":        f["description"],
-            "suggestion":         f["suggestion"],
-            "cost_usd_monthly":   cost_data["cost_usd_monthly"],
-            "cost_inr_monthly":   cost_data["cost_inr_monthly"],
+            # ── Core fields ───────────────────────────────────
+            "rule_id":     f["rule_id"],
+            "context":     f["context"],
+            "line":        f["line"],
+            "severity":    f["severity"],
+            "weight":      f["weight"],
+            "title":       f["title"],
+            "description": f["description"],
+            "suggestion":  f["suggestion"],
+
+            # ── Cost fields (EC2+RDS model) ───────────────────
+            "cost_usd_monthly":  cost_data["cost_usd_monthly"],
+            "cost_inr_monthly":  cost_data["cost_inr_monthly"],
+            "cost_breakdown":    cost_data["breakdown"],         # tier delta detail → extension hover
+
+            # ── Carbon fields (CEA 2023, 0.708 kg/kWh) ───────
             "carbon_kg_monthly":  carbon_data["carbon_kg_monthly"],
+            "carbon_projections": carbon_data["projections"],   # 1x/10x/100x → extension hover
         })
 
     green_score = compute_green_score(total_weight)
