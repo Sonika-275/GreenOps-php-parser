@@ -51,7 +51,7 @@ class TransactionReportService
 
         while ($processed < count($pending)) {
             $payment = $pending[$processed];
-            $this->processPayment($payment);
+            $this->processPayment($payment);>
             $processed++;
         }
     }

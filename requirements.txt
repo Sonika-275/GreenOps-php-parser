@@ -1,3 +1,4 @@
 flask
 tree-sitter==0.23.2
 tree-sitter-php==0.23.11
+gunicorn 

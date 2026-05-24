@@ -1,4 +1,7 @@
 import * as vscode from 'vscode';
+import * as https from 'https';
+import * as http from 'http';
+import { IncomingMessage } from 'http';
 
 // ── Types ─────────────────────────────────────────────────────
 interface ScalingDetail {
@@ -109,6 +112,43 @@ const decorationMedium = vscode.window.createTextEditorDecorationType({
 
 const allDecorations = [decorationVeryHigh, decorationHigh, decorationMedium];
 
+// ── HTTP helper (replaces fetch) ──────────────────────────────
+function postJSON<T>(baseUrl: string, path: string, payload: unknown): Promise<T> {
+    return new Promise((resolve, reject) => {
+        const body    = JSON.stringify(payload);
+        const url     = new URL(path, baseUrl);
+        const isHttps = url.protocol === 'https:';
+        const options = {
+            hostname: url.hostname,
+            port:     url.port || (isHttps ? 443 : 80),
+            path:     url.pathname + url.search,
+            method:   'POST',
+            headers:  {
+                'Content-Type':   'application/json',
+                'Content-Length': Buffer.byteLength(body),
+            },
+        };
+
+        const transport = isHttps ? https : http;
+        const req = transport.request(options, (res: IncomingMessage) => {
+            let raw = '';
+            res.on('data', (chunk: Buffer) => { raw += chunk; });
+            res.on('end', () => {
+                if (res.statusCode && res.statusCode >= 400) {
+                    reject(new Error(`Server error (${res.statusCode})`));
+                } else {
+                    try { resolve(JSON.parse(raw) as T); }
+                    catch (e) { reject(new Error('Invalid JSON response from server')); }
+                }
+            });
+        });
+
+        req.on('error', reject);
+        req.write(body);
+        req.end();
+    });
+}
+
 // ── Status Bar ────────────────────────────────────────────────
 let statusBar: vscode.StatusBarItem;
 
@@ -141,18 +181,8 @@ export function activate(context: vscode.ExtensionContext) {
             const baseUrl = config.get<string>('serverUrl') ?? 'http://localhost:8000';
 
             try {
-                const response = await fetch(
-                    `${baseUrl}/analyze`,
-                    {
-                        method:  'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body:    JSON.stringify({ code })
-                    }
-                );
+                const data = await postJSON<AnalyzeResponse>(baseUrl, '/analyze', { code });
 
-                if (!response.ok) { throw new Error(`Server error (${response.status})`); }
-
-                const data       = await response.json() as AnalyzeResponse;
                 const issueCount = data.issues.length;
                 const score      = Math.round(data.green_score);
 
@@ -275,7 +305,7 @@ export function activate(context: vscode.ExtensionContext) {
             } catch (error: any) {
                 statusBar.text  = '$(error) GreenOps — connection error';
                 statusBar.color = '#f87171';
-                vscode.window.showErrorMessage(`GreenOps Error: ${error.message} — is the server running at ${vscode.workspace.getConfiguration('greenops').get<string>('serverUrl') ?? 'http://localhost:5000'}?`);
+                vscode.window.showErrorMessage(`GreenOps Error: ${error.message} | ${error.stack}`);
             }
         }
     );

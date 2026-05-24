@@ -11,6 +11,12 @@ import tree_sitter_php as ts_php
 _PHP_LANGUAGE: Language = None
 _PARSER: Parser = None
 
+def get_language() -> Language:
+    global _PHP_LANGUAGE
+    if _PHP_LANGUAGE is None:
+        _PHP_LANGUAGE = Language(ts_php.language_php())
+    return _PHP_LANGUAGE
+
 
 def get_parser() -> Parser:
     global _PHP_LANGUAGE, _PARSER
@@ -18,13 +24,6 @@ def get_parser() -> Parser:
         _PHP_LANGUAGE = Language(ts_php.language_php())
         _PARSER = Parser(_PHP_LANGUAGE)
     return _PARSER
-
-
-def get_language() -> Language:
-    global _PHP_LANGUAGE
-    if _PHP_LANGUAGE is None:
-        _PHP_LANGUAGE = Language(ts_php.language_php())
-    return _PHP_LANGUAGE
 
 
 def parse_php(source_code: str) -> object:
