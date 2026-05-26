@@ -21,9 +21,10 @@ def analyze_code():
 
         source_code  = body["code"]
         runs_per_day = int(body.get("runs_per_day", 10_000))
+        file_path    = body.get("file_path", "")
 
-        engine_output   = analyze(source_code, runs_per_day)
-        response        = format_response(engine_output)
+        engine_output = analyze(source_code, runs_per_day, file_path)
+        response      = format_response(engine_output)
 
         return jsonify(response), 200
 

@@ -8,10 +8,13 @@ Contexts detected:
   C3 — Nested foreach with DB call       (CRITICAL — N×M queries)
   C4 — N+1 hidden inside a function/method
 
-Decision tree mirrors the docx exactly.
+False positive guards:
+  - Non-DB facades excluded via facade_exclusions.py
+  - DB::table() query builder chains excluded from static model call detection
 """
 
 from typing import List, Dict, Any
+from utils.facade_exclusions import is_non_db_facade
 
 # Eloquent methods that execute a query (terminal methods)
 ELOQUENT_TERMINAL_METHODS = {
@@ -32,6 +35,9 @@ ELOQUENT_STATIC_METHODS = {
 }
 
 LOOP_TYPES = {"foreach_statement", "for_statement", "while_statement"}
+
+# Query builder root — DB::table() is not Eloquent, exclude from R1
+DB_QUERY_BUILDER_ROOT = "DB"
 
 
 # ── AST Traversal Helpers ────────────────────────────────────
@@ -96,6 +102,27 @@ def get_line(node) -> int:
 
 # ── Chain Analysis ────────────────────────────────────────────
 
+def get_chain_root_class(node) -> str:
+    """
+    Walk to the root of the call chain and return the class name.
+    e.g. DB::table()->where()->get() → 'DB'
+         User::where()->get()        → 'User'
+    """
+    current = node
+    while current is not None:
+        if current.type == "scoped_call_expression":
+            if current.children:
+                class_node = current.children[0]
+                if class_node.type == "name":
+                    return class_node.text.decode("utf-8")
+            break
+        if current.children:
+            current = current.children[0]
+        else:
+            break
+    return ""
+
+
 def get_method_chain_names(node, source: bytes) -> List[str]:
     """
     Walk up member_call_expression chain and collect all method names.
@@ -105,7 +132,6 @@ def get_method_chain_names(node, source: bytes) -> List[str]:
     current = node
     while current is not None:
         if current.type == "member_call_expression":
-            # name child is the method name
             for child in current.children:
                 if child.type == "name":
                     names.append(child.text.decode("utf-8"))
@@ -114,7 +140,6 @@ def get_method_chain_names(node, source: bytes) -> List[str]:
                 if child.type == "name" and child != current.children[0]:
                     names.append(child.text.decode("utf-8"))
             break
-        # walk down into the object/callee
         current = current.children[0] if current.children else None
     return names
 
@@ -129,7 +154,6 @@ def is_relationship_call(node, source: bytes) -> bool:
     if node.type != "member_call_expression":
         return False
 
-    # Get the method name of this call
     method_name = None
     for child in node.children:
         if child.type == "name":
@@ -138,15 +162,11 @@ def is_relationship_call(node, source: bytes) -> bool:
     if method_name not in ELOQUENT_TERMINAL_METHODS:
         return False
 
-    # The object being called on must be a member_call_expression
-    # (meaning it's $var->something()->get(), not Class::something()->get())
     obj = node.children[0] if node.children else None
     if obj is None:
         return False
 
-    # $user->posts()->get() — obj is member_call_expression on a variable
     if obj.type == "member_call_expression":
-        # Check the base is a variable, not a scoped (Class::)
         base = obj
         while base.children and base.type == "member_call_expression":
             base = base.children[0]
@@ -158,9 +178,13 @@ def is_relationship_call(node, source: bytes) -> bool:
 
 def is_static_model_call(node, source: bytes) -> bool:
     """
-    Detect: Model::find($id), Model::where()->get() inside loop
-    Pattern: scoped_call_expression OR member_call_expression on scoped_call_expression
+    Detect: Model::find($id), Model::where()->get() inside loop.
+    Excludes DB::table() query builder chains — not Eloquent.
     """
+    # exclude DB::table() query builder
+    if get_chain_root_class(node) == DB_QUERY_BUILDER_ROOT:
+        return False
+
     if node.type == "scoped_call_expression":
         method_name = None
         for child in node.children:
@@ -176,7 +200,6 @@ def is_static_model_call(node, source: bytes) -> bool:
                 method_name = child.text.decode("utf-8")
         if method_name not in ELOQUENT_TERMINAL_METHODS:
             return False
-        # Walk to base — must be scoped_call_expression (Class::)
         base = node.children[0] if node.children else None
         while base and base.type == "member_call_expression":
             base = base.children[0] if base.children else None
@@ -201,13 +224,17 @@ def collect_all_nodes(root) -> List:
 
 def detect(tree, source: bytes) -> List[Dict[str, Any]]:
     findings = []
-    seen_lines = set()  # avoid duplicate findings on same line
+    seen_lines = set()
 
     all_nodes = collect_all_nodes(tree.root_node)
 
     for node in all_nodes:
         line = get_line(node)
         if line in seen_lines:
+            continue
+
+        # skip non-DB facade calls (Cache, Session, Redis, Http, File etc.)
+        if is_non_db_facade(node, source):
             continue
 
         # ── Check relationship call ($var->rel()->get()) ──────
@@ -222,7 +249,6 @@ def detect(tree, source: bytes) -> List[Dict[str, Any]]:
             in_function = is_inside_function(node)
 
             if in_nested:
-                # Context 3 — CRITICAL
                 findings.append({
                     "rule_id": "R1",
                     "context": 3,
@@ -241,7 +267,6 @@ def detect(tree, source: bytes) -> List[Dict[str, Any]]:
                     ),
                 })
             else:
-                # Context 1 or Context 4
                 if in_function:
                     fix = (
                         "Use $collection->load('relationship') before the loop "

@@ -3,14 +3,16 @@ engine.py
 Orchestrates the full analysis pipeline:
   1. Parse PHP source with tree-sitter
   2. Run all three rules
-  3. Attach cost + carbon to each finding
-  4. Compute green score
+  3. Apply folder-context severity modifier
+  4. Attach cost + carbon to each finding
+  5. Compute green score
 """
 
 from analyzer.tree_sitter_setup import parse_php
 from analyzer.rules import rule1_n1_query, rule2_count_recalc, rule3_select_star
 from analyzer.cost import estimate_cost
 from analyzer.carbon import estimate_carbon
+from utils.severity_modifier import apply as apply_severity_modifier
 
 # Weight → score mapping
 # Total weight budget: a file with all worst-case findings would be ~360
@@ -23,9 +25,10 @@ def compute_green_score(total_weight: int) -> int:
     return max(0, min(100, score))
 
 
-def analyze(source_code: str, runs_per_day: int = 10_000) -> dict:
+def analyze(source_code: str, runs_per_day: int = 10_000, file_path: str = "") -> dict:
     """
-    Main entry point. Takes PHP source as string.
+    Main entry point. Takes PHP source as string and optional file path.
+    file_path is used for folder-context severity adjustment.
     Returns structured findings dict ready for reporter.
     """
     source_bytes = source_code.encode("utf-8") if isinstance(source_code, str) else source_code
@@ -39,6 +42,9 @@ def analyze(source_code: str, runs_per_day: int = 10_000) -> dict:
 
     # Sort by line number for clean output
     findings_raw.sort(key=lambda f: f["line"])
+
+    # Apply folder-context severity modifier
+    findings_raw = apply_severity_modifier(findings_raw, file_path)
 
     # Attach cost + carbon to each finding
     findings = []
@@ -65,14 +71,17 @@ def analyze(source_code: str, runs_per_day: int = 10_000) -> dict:
             "description": f["description"],
             "suggestion":  f["suggestion"],
 
+            # ── Severity note (present only if downgraded) ────
+            "severity_note": f.get("severity_note", ""),
+
             # ── Cost fields (EC2+RDS model) ───────────────────
             "cost_usd_monthly":  cost_data["cost_usd_monthly"],
             "cost_inr_monthly":  cost_data["cost_inr_monthly"],
-            "cost_breakdown":    cost_data["breakdown"],         # tier delta detail → extension hover
+            "cost_breakdown":    cost_data["breakdown"],
 
             # ── Carbon fields (CEA 2023, 0.708 kg/kWh) ───────
             "carbon_kg_monthly":  carbon_data["carbon_kg_monthly"],
-            "carbon_projections": carbon_data["projections"],   # 1x/10x/100x → extension hover
+            "carbon_projections": carbon_data["projections"],
         })
 
     green_score = compute_green_score(total_weight)
@@ -85,4 +94,5 @@ def analyze(source_code: str, runs_per_day: int = 10_000) -> dict:
         "total_cost_usd_monthly": round(total_cost, 4),
         "total_cost_inr_monthly": round(total_cost * 84, 2),
         "runs_per_day":           runs_per_day,
+        "file_path":              file_path,
     }
