@@ -181,7 +181,8 @@ export function activate(context: vscode.ExtensionContext) {
             const baseUrl = config.get<string>('serverUrl') ?? 'http://localhost:8000';
 
             try {
-                const data = await postJSON<AnalyzeResponse>(baseUrl, '/analyze', { code });
+                const filePath = editor.document.fileName ?? '';
+                const data = await postJSON<AnalyzeResponse>(baseUrl, '/analyze', { code, file_path: filePath });
 
                 const issueCount = data.issues.length;
                 const score      = Math.round(data.green_score);

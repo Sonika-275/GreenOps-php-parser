@@ -41,6 +41,9 @@ LOOP_TYPES = {"foreach_statement", "for_statement", "while_statement"}
 
 DB_QUERY_BUILDER_ROOT = "DB"
 
+# Common settings/config model name patterns — suggest caching instead of just select
+SETTINGS_PATTERNS = {"setting", "config", "configuration", "option", "preference", "parameter"}
+
 
 def get_node_text(node, source: bytes) -> str:
     return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
@@ -193,6 +196,29 @@ def is_terminal_eloquent_call(node) -> bool:
             return True
 
     return False
+
+
+def is_settings_model(node) -> bool:
+    """
+    Check if the model name suggests a static config/settings table.
+    These should suggest caching as the fix, not just select().
+    """
+    root = get_chain_root_class(node).lower()
+    return any(pattern in root for pattern in SETTINGS_PATTERNS)
+
+
+def build_suggestion(base_suggestion: str, node) -> str:
+    """
+    Append caching note if model looks like a settings/config table.
+    """
+    if is_settings_model(node):
+        return (
+            base_suggestion +
+            " — Note: this appears to be a static config table. "
+            "Consider caching: Cache::remember('settings_key', 3600, "
+            "fn() => Setting::select('col1','col2')->first())"
+        )
+    return base_suggestion
 
 
 def is_query_builder_call(node) -> bool:
@@ -370,23 +396,27 @@ def detect(tree, source: bytes) -> List[Dict[str, Any]]:
 
         # ── Context 4 — with() present but no select ─────────
         if has_with:
+            # eager load ending with first() → single record → medium not high
+            eager_severity = "medium" if method in {"first", "firstOrFail"} else "high"
+            eager_weight   = 25 if method in {"first", "firstOrFail"} else 40
             findings.append({
                 "rule_id": "R3",
                 "context": 4,
                 "line": line,
-                "severity": "high",
-                "weight": 40,
+                "severity": eager_severity,
+                "weight": eager_weight,
                 "title": "Eager load with() missing select() — SELECT * on both models",
                 "description": (
                     "with() eager loading fixed the N+1 problem but "
                     "still fetches ALL columns on parent and related model."
                 ),
-                "suggestion": (
+                "suggestion": build_suggestion(
                     "Add select() on parent model and use a closure on related: "
                     "Model::select('id','name','email')"
                     "->with(['relationship' => fn($q) => "
                     "$q->select('id','foreign_key','col1')])->get(). "
-                    "Always include the foreign key in the related select."
+                    "Always include the foreign key in the related select.",
+                    node
                 ),
             })
             seen_lines.add(line)
@@ -405,9 +435,10 @@ def detect(tree, source: bytes) -> List[Dict[str, Any]]:
                     "get() executes SELECT * — fetches all columns. "
                     "Developer added WHERE but left SELECT * untouched."
                 ),
-                "suggestion": (
+                "suggestion": build_suggestion(
                     "Add select() before get(): "
-                    "Model::select('id','col1','col2')->where(...)->get()"
+                    "Model::select('id','col1','col2')->where(...)->get()",
+                    node
                 ),
             })
             seen_lines.add(line)
@@ -426,9 +457,10 @@ def detect(tree, source: bytes) -> List[Dict[str, Any]]:
                     f"{method}() fetches one row but still selects all columns. "
                     "Multiplied across thousands of auth/lookup requests per day."
                 ),
-                "suggestion": (
+                "suggestion": build_suggestion(
                     f"Add select() before {method}(): "
-                    f"Model::select('id','name','email')->where(...)->{method}()"
+                    f"Model::select('id','name','email')->where(...)->{method}()",
+                    node
                 ),
             })
             seen_lines.add(line)
