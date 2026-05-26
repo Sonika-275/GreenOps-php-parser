@@ -12,7 +12,7 @@ from analyzer.tree_sitter_setup import parse_php
 from analyzer.rules import rule1_n1_query, rule2_count_recalc, rule3_select_star
 from analyzer.cost import estimate_cost
 from analyzer.carbon import estimate_carbon
-from utils.severity_modifier import apply as apply_severity_modifier
+from analyzer.utils.severity_modifier import apply as apply_severity_modifier
 
 # Weight → score mapping
 # Total weight budget: a file with all worst-case findings would be ~360

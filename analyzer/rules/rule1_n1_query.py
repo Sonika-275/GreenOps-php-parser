@@ -14,7 +14,7 @@ False positive guards:
 """
 
 from typing import List, Dict, Any
-from utils.facade_exclusions import is_non_db_facade
+from analyzer.utils.facade_exclusions import is_non_db_facade
 
 # Eloquent methods that execute a query (terminal methods)
 ELOQUENT_TERMINAL_METHODS = {

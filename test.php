@@ -1,103 +1,161 @@
 <?php
 
-namespace App\Services;
+/**
+ * test_false_positives.php
+ * All patterns below should NOT be flagged by GreenOps after fixes.
+ * If any are tagged — it's a false positive bug.
+ */
 
-use App\Models\Transaction;
-use App\Models\Account;
-use App\Models\Customer;
-use App\Models\Payment;
-use App\Models\Invoice;
-use App\Models\Merchant;
-
-class TransactionReportService
+class TestFalsePositives
 {
-    /**
-     * Generate daily transaction summary for all accounts
-     * Called by scheduler every night — 10,000+ runs/month
-     */
-    public function generateDailySummary()
+
+    // ── CATEGORY 1: Non-DB Facades ────────────────────────────
+
+    public function testCacheGet()
     {
-        // Fetch all accounts — no filter, no column selection
-        $accounts = Account::all();
-
-        $report = [];
-
-        foreach ($accounts as $account) {
-            // Fetch transactions per account inside loop
-            $transactions = Transaction::where('account_id', $account->id)->get();
-
-            foreach ($transactions as $txn) {
-                // Fetch merchant details inside inner loop
-                $merchant = Merchant::find($txn->merchant_id);
-
-                $report[] = [
-                    'account' => $account->name,
-                    'amount' => $txn->amount,
-                    'merchant' => $merchant->name,
-                ];
-            }
-        }
-
-        return $report;
+        // Cache::get() — not a DB call
+        $value = Cache::get('key');
     }
 
-    /**
-     * Get pending payment queue — runs on every API request
-     */
-    public function processPendingPayments()
+    public function testCacheLock()
     {
-        $pending = Payment::where('status', 'pending')->get();
-        $processed = 0;
-
-        while ($processed < count($pending)) {
-            $payment = $pending[$processed];
-            $this->processPayment($payment);>
-            $processed++;
-        }
+        // Cache::lock()->get() — transaction lock, not DB
+        $value = Cache::lock('key')->get();
     }
 
-    /**
-     * Customer KYC verification report
-     */
-    public function getKYCReport()
+    public function testSessionGet()
     {
-        $customers = Customer::with('kycDocuments')->get();
-
-        foreach ($customers as $customer) {
-            $invoices = Invoice::where('customer_id', $customer->id)->get();
-            echo $customer->name . ' has ' . count($invoices) . ' invoices';
-        }
+        // Session::get() — not a DB call
+        $value = Session::get('user_id');
     }
 
-    /**
-     * Batch reconciliation — runs for each settlement cycle
-     */
-    public function reconcileTransactions(array $accountIds)
+    public function testRedis()
     {
-        $total = 0;
-
-        for ($i = 0; $i < count($accountIds); $i++) {
-            $account = Account::find($accountIds[$i]);
-            $txns = Transaction::where('account_id', $account->id)
-                ->where('status', 'settled')
-                ->get();
-            $total += $txns->sum('amount');
-        }
-
-        return $total;
+        // Redis::get() — not a DB call
+        $value = Redis::get('key');
     }
 
-    /**
-     * Auth flow — called on every login
-     */
-    public function getCustomerProfile(string $email)
+    public function testCookieGet()
     {
-        $customer = Customer::where('email', $email)->first();
-        return $customer;
+        // Cookie::get() — not a DB call
+        $value = Cookie::get('token');
     }
 
-    private function processPayment($payment)
+    public function testHttpGet()
     {
-        // payment processing logic
+        // Http::withHeaders()->get() — HTTP client, not DB
+        $response = Http::withHeaders(['Accept' => 'application/json'])->get('https://api.example.com');
     }
+
+    public function testFileGet()
+    {
+        // File::get() — filesystem, not DB
+        $contents = File::get(public_path('img/logo.png'));
+    }
+
+    public function testStorageGet()
+    {
+        // Storage::get() — filesystem, not DB
+        $file = Storage::get('uploads/file.pdf');
+    }
+
+    public function testArrGet()
+    {
+        // Arr::get() — array helper, not DB
+        $value = Arr::get($data, 'key', 'default');
+    }
+
+    public function testSelfGet()
+    {
+        // self::get() — self reference, not DB
+        $value = self::getSomething();
+    }
+
+    // ── CATEGORY 2: Pattern Mismatches ───────────────────────
+
+    public function testLockForUpdate()
+    {
+        // lockForUpdate() — intentional transaction lock
+        $ride = \DB::table('rides')
+            ->where('id', $id)
+            ->where('status', 'pending')
+            ->lockForUpdate()
+            ->first();
+    }
+
+    public function testSharedLock()
+    {
+        // sharedLock() — intentional lock
+        $user = User::where('id', $id)->sharedLock()->first();
+    }
+
+    public function testGetThenFirst()
+    {
+        // ->get()->first() — in-memory collection operation, not DB terminal
+        $users = User::select('id', 'name')->where('active', 1)->get()->first();
+    }
+
+    public function testGetThenFilter()
+    {
+        // ->get()->filter() — in-memory collection operation
+        $users = User::select('id', 'name')->get()->filter(fn($u) => $u->active);
+    }
+
+    public function testSelectDbRaw()
+    {
+        // select(DB::raw()) — valid select, should not be flagged
+        $rides = Ride::select(DB::raw('count(*) as total, status'))
+            ->groupBy('status')
+            ->get();
+    }
+
+    public function testSelectRaw()
+    {
+        // selectRaw() — valid select
+        $results = User::selectRaw('id, name, count(*) as total')
+            ->groupBy('id')
+            ->get();
+    }
+
+    public function testAddSelect()
+    {
+        // addSelect() — valid select
+        $users = User::addSelect('id', 'name')->where('active', 1)->get();
+    }
+
+    // ── CATEGORY 2: DB::table() — not Eloquent ───────────────
+
+    public function testDbTableNotEloquent()
+    {
+        // DB::table() with select — already optimised, should not flag
+        $rides = \DB::table('rides')
+            ->select('id', 'status', 'driver_id')
+            ->where('status', 'active')
+            ->get();
+    }
+
+    public function testDbSelectRaw()
+    {
+        // DB::select() — raw SQL, not query builder
+        $results = \DB::select('SELECT id, name FROM users WHERE active = ?', [1]);
+    }
+
+    // ── CATEGORY 4: Severity Context ─────────────────────────
+
+    public function testFirstStandalone()
+    {
+        // first() standalone — should be LOW severity (not medium)
+        // this IS a true positive but should show as low severity
+        $user = User::where('email', $email)->first();
+        return $user;
+    }
+
+    public function testEagerLoadWithFirst()
+    {
+        // eager load + first() — should be MEDIUM severity (not high)
+        // this IS a true positive but should show as medium severity
+        $user = User::with('vehicle')->where('id', $id)->first();
+        return $user;
+    }
+
 }
