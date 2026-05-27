@@ -1,83 +1,69 @@
 <?php
 
 /**
- * test_false_positives.php
- * All patterns below should NOT be flagged by GreenOps after fixes.
- * If any are tagged — it's a false positive bug.
+ * test_false_positives_v2.php
+ * 
+ * SECTION A — Should NOT be tagged (false positive fixes)
+ * SECTION B — Should be tagged (true positives with correct severity)
  */
 
-class TestFalsePositives
+class TestFalsePositivesV2
 {
 
-    // ── CATEGORY 1: Non-DB Facades ────────────────────────────
+    // ════════════════════════════════════════════════════════
+    // SECTION A — SHOULD NOT BE TAGGED
+    // ════════════════════════════════════════════════════════
 
-    public function testCacheGet()
+    // ── Backslash prefix facades ──────────────────────────
+
+    public function testBackslashSession()
     {
-        // Cache::get() — not a DB call
-        $value = Cache::get('key');
+        // \Session:: — backslash prefix, not DB
+        $userId = \Session::get('user_id');
     }
 
-    public function testCacheLock()
+    public function testBackslashCache()
     {
-        // Cache::lock()->get() — transaction lock, not DB
-        $value = Cache::lock('key')->get();
+        // \Cache:: — backslash prefix, not DB
+        $value = \Cache::get('key');
     }
 
-    public function testSessionGet()
+    public function testBackslashRedis()
     {
-        // Session::get() — not a DB call
-        $value = Session::get('user_id');
+        // \Redis:: — backslash prefix, not DB
+        $value = \Redis::get('driver_location');
     }
 
-    public function testRedis()
+    public function testFullyQualifiedHttp()
     {
-        // Redis::get() — not a DB call
-        $value = Redis::get('key');
+        // \Illuminate\Support\Facades\Http:: — fully qualified, not DB
+        $response = \Illuminate\Support\Facades\Http::get('https://api.example.com');
     }
 
-    public function testCookieGet()
+    public function testFullyQualifiedHttpWithHeaders()
     {
-        // Cookie::get() — not a DB call
-        $value = Cookie::get('token');
+        // \Illuminate\Support\Facades\Http::withHeaders()->get()
+        $response = \Illuminate\Support\Facades\Http::withHeaders([
+            'Accept' => 'application/json'
+        ])->get('https://api.example.com/rides');
     }
 
-    public function testHttpGet()
+    public function testBackslashDB()
     {
-        // Http::withHeaders()->get() — HTTP client, not DB
-        $response = Http::withHeaders(['Accept' => 'application/json'])->get('https://api.example.com');
+        // \DB::table() with select — already optimised, not Eloquent
+        $rides = \DB::table('rides')
+            ->select('id', 'status', 'driver_id')
+            ->where('status', 'active')
+            ->get();
     }
 
-    public function testFileGet()
-    {
-        // File::get() — filesystem, not DB
-        $contents = File::get(public_path('img/logo.png'));
-    }
-
-    public function testStorageGet()
-    {
-        // Storage::get() — filesystem, not DB
-        $file = Storage::get('uploads/file.pdf');
-    }
-
-    public function testArrGet()
-    {
-        // Arr::get() — array helper, not DB
-        $value = Arr::get($data, 'key', 'default');
-    }
-
-    public function testSelfGet()
-    {
-        // self::get() — self reference, not DB
-        $value = self::getSomething();
-    }
-
-    // ── CATEGORY 2: Pattern Mismatches ───────────────────────
+    // ── lockForUpdate — transaction lock ──────────────────
 
     public function testLockForUpdate()
     {
-        // lockForUpdate() — intentional transaction lock
-        $ride = \DB::table('rides')
-            ->where('id', $id)
+        // RideRequest::where()->where()->lockForUpdate()->first()
+        // intentional transaction lock — should NOT be flagged
+        $rideRequest = RideRequest::where('id', $id)
             ->where('status', 'pending')
             ->lockForUpdate()
             ->first();
@@ -86,76 +72,189 @@ class TestFalsePositives
     public function testSharedLock()
     {
         // sharedLock() — intentional lock
-        $user = User::where('id', $id)->sharedLock()->first();
+        $ride = Ride::where('id', $id)->sharedLock()->first();
     }
 
-    public function testGetThenFirst()
+    public function testLockForShare()
     {
-        // ->get()->first() — in-memory collection operation, not DB terminal
-        $users = User::select('id', 'name')->where('active', 1)->get()->first();
+        // lockForShare() — intentional lock
+        $payment = Payment::where('ride_id', $id)->lockForShare()->first();
     }
 
-    public function testGetThenFilter()
-    {
-        // ->get()->filter() — in-memory collection operation
-        $users = User::select('id', 'name')->get()->filter(fn($u) => $u->active);
-    }
+    // ── select(DB::raw()) — valid select ──────────────────
 
     public function testSelectDbRaw()
     {
-        // select(DB::raw()) — valid select, should not be flagged
+        // select(DB::raw()) — valid column selection
         $rides = Ride::select(DB::raw('count(*) as total, status'))
             ->groupBy('status')
+            ->get();
+    }
+
+    public function testSelectDbRawOne()
+    {
+        // select(DB::raw(1)) — existence check pattern
+        $exists = Ride::whereIn('id', $ids)
+            ->whereNotExists(function ($q) {
+                $q->select(DB::raw(1))
+                    ->from('cancelled_rides')
+                    ->whereColumn('ride_id', 'rides.id');
+            })
             ->get();
     }
 
     public function testSelectRaw()
     {
         // selectRaw() — valid select
-        $results = User::selectRaw('id, name, count(*) as total')
-            ->groupBy('id')
+        $results = Driver::selectRaw('id, name, count(*) as total_rides')
+            ->groupBy('id', 'name')
             ->get();
     }
 
     public function testAddSelect()
     {
         // addSelect() — valid select
-        $users = User::addSelect('id', 'name')->where('active', 1)->get();
-    }
-
-    // ── CATEGORY 2: DB::table() — not Eloquent ───────────────
-
-    public function testDbTableNotEloquent()
-    {
-        // DB::table() with select — already optimised, should not flag
-        $rides = \DB::table('rides')
-            ->select('id', 'status', 'driver_id')
-            ->where('status', 'active')
+        $users = User::addSelect('id', 'name', 'mobile_no')
+            ->where('active', 1)
             ->get();
     }
 
-    public function testDbSelectRaw()
+    // ── get()->first() — in-memory collection ops ─────────
+
+    public function testGetThenFirst()
     {
-        // DB::select() — raw SQL, not query builder
-        $results = \DB::select('SELECT id, name FROM users WHERE active = ?', [1]);
+        // ->get()->first() — in-memory, not DB terminal
+        $driver = Driver::select('id', 'name')->where('active', 1)->get()->first();
     }
 
-    // ── CATEGORY 4: Severity Context ─────────────────────────
-
-    public function testFirstStandalone()
+    public function testGetThenFilter()
     {
-        // first() standalone — should be LOW severity (not medium)
-        // this IS a true positive but should show as low severity
+        // ->get()->filter() — in-memory
+        $drivers = Driver::select('id', 'name')->get()->filter(fn($d) => $d->active);
+    }
+
+    public function testGetThenMap()
+    {
+        // ->get()->map() — in-memory
+        $names = User::select('id', 'name')->get()->map(fn($u) => $u->name);
+    }
+
+    // ── Cache / Session / Redis ───────────────────────────
+
+    public function testCacheGet()
+    {
+        $value = Cache::get('app_settings');
+    }
+
+    public function testCacheLockGet()
+    {
+        // Cache::lock()->get() — lock acquisition not DB
+        $result = Cache::lock('ride_lock')->get();
+    }
+
+    public function testSessionGet()
+    {
+        $userId = Session::get('user_id');
+    }
+
+    public function testRedisGet()
+    {
+        $location = Redis::get('driver:123:location');
+    }
+
+    public function testCookieGet()
+    {
+        $token = Cookie::get('auth_token');
+    }
+
+    public function testFileGet()
+    {
+        $contents = File::get(public_path('img/logo.png'));
+    }
+
+    public function testStorageGet()
+    {
+        $file = Storage::get('uploads/document.pdf');
+    }
+
+    public function testArrGet()
+    {
+        $value = Arr::get($data, 'driver.name', 'unknown');
+    }
+
+    public function testHttpGet()
+    {
+        $response = Http::withHeaders(['Accept' => 'application/json'])
+            ->get('https://maps.googleapis.com/api');
+    }
+
+    // ════════════════════════════════════════════════════════
+    // SECTION B — SHOULD BE TAGGED (true positives)
+    // ════════════════════════════════════════════════════════
+
+    public function testTruePositiveGetNoSelect()
+    {
+        // R3 C2 — get() without select → MEDIUM severity
+        $drivers = Driver::where('active', 1)->where('city', 'Salem')->get();
+    }
+
+    public function testTruePositiveFirstNoSelect()
+    {
+        // R3 C3 — first() without select → LOW severity
         $user = User::where('email', $email)->first();
-        return $user;
     }
 
-    public function testEagerLoadWithFirst()
+    public function testTruePositiveEagerLoadNoSelect()
     {
-        // eager load + first() — should be MEDIUM severity (not high)
-        // this IS a true positive but should show as medium severity
+        // R3 C4 — with() without select → HIGH severity
+        $user = User::with('vehicle')->where('id', $id)->get();
+    }
+
+    public function testTruePositiveEagerLoadFirstNoSelect()
+    {
+        // R3 C4 — with() + first() without select → MEDIUM severity
         $user = User::with('vehicle')->where('id', $id)->first();
-        return $user;
+    }
+
+    public function testTruePositiveGetInLoop()
+    {
+        // R3 C5 — get() inside loop → VERY HIGH severity
+        foreach ($categories as $cat) {
+            $drivers = Driver::where('category_id', $cat->id)->get();
+        }
+    }
+
+    public function testTruePositiveN1InLoop()
+    {
+        // R1 — static model call inside foreach → HIGH severity
+        foreach ($rides as $ride) {
+            $driver = Driver::find($ride->driver_id);
+        }
+    }
+
+    public function testTruePositiveDbTableNoSelect()
+    {
+        // R3 C6 — DB::table()->get() without select → MEDIUM severity
+        $rides = \DB::table('rides')
+            ->where('status', 'active')
+            ->orderBy('created_at', 'desc')
+            ->get();
+    }
+
+    public function testTruePositiveDbTableFirstNoSelect()
+    {
+        // R3 C7 — DB::table()->first() without select → LOW severity
+        $setting = \DB::table('settings')
+            ->where('key', 'pickup_radius')
+            ->first();
+    }
+
+    public function testTruePositiveSelfWhereFirst()
+    {
+        // self:: Eloquent call — true positive → LOW severity
+        $openSession = self::where('driver_id', $driverId)
+            ->whereNull('ended_at')
+            ->first();
     }
 
 }

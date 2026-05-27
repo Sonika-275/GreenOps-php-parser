@@ -12,11 +12,12 @@ Contexts detected:
   C7 — DB::table()->first() without select() LOW    (Query Builder SELECT*)
 
 False positive guards:
-  - Non-DB facades excluded via facade_exclusions.py
+  - Non-DB facades excluded via facade_exclusions.py (incl. \Session::, \Illuminate\...\Http::)
   - lockForUpdate() / sharedLock() / lockForShare() → intentional locks, skip
   - selectRaw() / addSelect() / select(DB::raw()) → valid select, skip
   - DB::table() handled separately as query builder (C6/C7), not Eloquent
   - get()->first/last/filter/map() → in-memory collection ops, not DB terminal
+  - Ride::whereIn()->...->select(DB::raw(1)) → select() in chain → skip
 """
 
 from typing import List, Dict, Any
@@ -24,16 +25,15 @@ from analyzer.utils.facade_exclusions import is_non_db_facade
 
 TERMINAL_METHODS = {"get", "all", "first", "paginate", "firstOrFail", "findOrFail"}
 
-# Query builder terminal methods
 QB_TERMINAL_METHODS = {"get", "first", "firstOrFail"}
 
 # Transaction lock methods — intentional, never flag
 LOCK_METHODS = {"lockForUpdate", "sharedLock", "lockForShare"}
 
-# Valid select patterns — if any present in chain, query is already optimised
+# Valid select patterns — if ANY present in chain, query is already optimised
 VALID_SELECT_METHODS = {"select", "selectRaw", "addSelect"}
 
-# In-memory collection operations — get() here is not a DB terminal
+# In-memory collection operations
 COLLECTION_OPS = {"first", "last", "find", "filter", "map", "where",
                   "each", "reduce", "reject", "pluck", "keyBy", "groupBy"}
 
@@ -41,7 +41,6 @@ LOOP_TYPES = {"foreach_statement", "for_statement", "while_statement"}
 
 DB_QUERY_BUILDER_ROOT = "DB"
 
-# Common settings/config model name patterns — suggest caching instead of just select
 SETTINGS_PATTERNS = {"setting", "config", "configuration", "option", "preference", "parameter"}
 
 
@@ -94,16 +93,29 @@ def get_method_name(node) -> str:
 def get_chain_root_class(terminal_node) -> str:
     """
     Walk to the root of the call chain and return the class name.
-    e.g. DB::table()->where()->get() → 'DB'
-         User::where()->get()        → 'User'
+    Handles backslash prefix and fully qualified namespaces.
     """
     current = terminal_node
     while current is not None:
         if current.type == "scoped_call_expression":
             if current.children:
                 class_node = current.children[0]
+                # simple name
                 if class_node.type == "name":
                     return class_node.text.decode("utf-8")
+                # qualified name \Session, \Illuminate\...\Http
+                if class_node.type in {
+                    "qualified_name", "namespace_name",
+                    "named_type", "relative_scope"
+                }:
+                    raw = class_node.text.decode("utf-8").lstrip("\\")
+                    return raw.split("\\")[-1]
+                # fallback
+                try:
+                    raw = class_node.text.decode("utf-8").lstrip("\\")
+                    return raw.split("\\")[-1]
+                except Exception:
+                    pass
             break
         if current.children:
             current = current.children[0]
@@ -114,17 +126,18 @@ def get_chain_root_class(terminal_node) -> str:
 
 def collect_chain_method_names(terminal_node) -> List[str]:
     """
-    Walk the full method chain and collect all method names.
-    e.g. Customer::select(...)->with(...)->get() → ['get', 'with', 'select']
+    Walk the full method chain and collect ALL method names.
+    Uses BFS on the full subtree to catch methods regardless of
+    nesting depth — fixes lockForUpdate and select(DB::raw()) detection.
     """
     names = []
-    current = terminal_node
 
+    # primary walk — follow leftmost child chain
+    current = terminal_node
     while current is not None:
         name = get_method_name(current)
         if name:
             names.append(name)
-
         if current.children:
             obj = current.children[0]
             if obj.type in {"member_call_expression", "scoped_call_expression"}:
@@ -134,17 +147,46 @@ def collect_chain_method_names(terminal_node) -> List[str]:
         else:
             break
 
+    # secondary pass — also scan full subtree text for method names
+    # this catches cases where AST nesting is deeper than expected
+    # e.g. lockForUpdate() nested inside complex chain
+    all_sub = collect_all_nodes(terminal_node)
+    for sub in all_sub:
+        if sub.type == "member_call_expression":
+            name = get_method_name(sub)
+            if name and name not in names:
+                names.append(name)
+
     return names
 
 
 def chain_has_select(terminal_node) -> bool:
-    """Check if any valid select method appears anywhere in the chain."""
+    """
+    Check if any valid select method appears anywhere in the chain.
+    Also checks raw source text as fallback for select(DB::raw()) patterns.
+    """
     chain = collect_chain_method_names(terminal_node)
-    return bool(VALID_SELECT_METHODS & set(chain))
+    if VALID_SELECT_METHODS & set(chain):
+        return True
+
+    # fallback — check raw source text for ->select( or ->selectRaw(
+    try:
+        import sys
+        # get source from node bytes
+        node_text = terminal_node.text.decode("utf-8") if hasattr(terminal_node, 'text') else ""
+        if "->select(" in node_text or "->selectRaw(" in node_text or "->addSelect(" in node_text:
+            return True
+    except Exception:
+        pass
+
+    return False
 
 
 def chain_has_lock(terminal_node) -> bool:
-    """Check if chain contains a transaction lock method."""
+    """
+    Check if chain contains a transaction lock method.
+    Uses full subtree scan to catch lockForUpdate() at any nesting depth.
+    """
     chain = collect_chain_method_names(terminal_node)
     return bool(LOCK_METHODS & set(chain))
 
@@ -180,7 +222,6 @@ def is_terminal_eloquent_call(node) -> bool:
     if method not in TERMINAL_METHODS:
         return False
 
-    # exclude DB::table() query builder — handled separately
     root_class = get_chain_root_class(node)
     if root_class == DB_QUERY_BUILDER_ROOT:
         return False
@@ -199,18 +240,11 @@ def is_terminal_eloquent_call(node) -> bool:
 
 
 def is_settings_model(node) -> bool:
-    """
-    Check if the model name suggests a static config/settings table.
-    These should suggest caching as the fix, not just select().
-    """
     root = get_chain_root_class(node).lower()
     return any(pattern in root for pattern in SETTINGS_PATTERNS)
 
 
 def build_suggestion(base_suggestion: str, node) -> str:
-    """
-    Append caching note if model looks like a settings/config table.
-    """
     if is_settings_model(node):
         return (
             base_suggestion +
@@ -224,21 +258,16 @@ def build_suggestion(base_suggestion: str, node) -> str:
 def is_query_builder_call(node) -> bool:
     """
     Detect DB::table()->get() or DB::table()->first() without select().
-    Root must be DB, method must be a QB terminal.
     """
     method = get_method_name(node)
     if method not in QB_TERMINAL_METHODS:
         return False
-
     root_class = get_chain_root_class(node)
     if root_class != DB_QUERY_BUILDER_ROOT:
         return False
-
-    # must have table() in chain — confirms it's DB::table() not DB::select()
     chain = collect_chain_method_names(node)
     if "table" not in chain:
         return False
-
     return True
 
 
@@ -249,7 +278,7 @@ def detect(tree, source: bytes) -> List[Dict[str, Any]]:
     all_nodes = collect_all_nodes(tree.root_node)
 
     for node in all_nodes:
-        # skip non-DB facade calls (Cache, Session, Redis, Http, File, Arr etc.)
+        # skip non-DB facade calls
         if is_non_db_facade(node, source):
             continue
 
@@ -264,11 +293,9 @@ def detect(tree, source: bytes) -> List[Dict[str, Any]]:
         # ── Query Builder detection (DB::table()) ────────────
         if is_query_builder_call(node):
 
-            # skip transaction locks
             if chain_has_lock(node):
                 continue
 
-            # already has select in chain — optimised, skip
             if chain_has_select(node):
                 continue
 
@@ -285,8 +312,7 @@ def detect(tree, source: bytes) -> List[Dict[str, Any]]:
                     "title": "DB::table() SELECT * inside loop — full row fetch per iteration",
                     "description": (
                         f"DB::table()->{method}() without select() inside a loop — "
-                        f"fetches ALL columns on every iteration. "
-                        f"Query Builder equivalent of N+1 + SELECT * combined."
+                        f"fetches ALL columns on every iteration."
                     ),
                     "suggestion": (
                         "Move query outside the loop. "
@@ -303,8 +329,7 @@ def detect(tree, source: bytes) -> List[Dict[str, Any]]:
                     "weight": 15,
                     "title": f"DB::table()->{method}() without select() — SELECT *",
                     "description": (
-                        f"Query Builder {method}() fetches one row but selects all columns. "
-                        f"Add select() to fetch only needed columns."
+                        f"Query Builder {method}() fetches one row but selects all columns."
                     ),
                     "suggestion": (
                         f"Add ->select() before ->{method}(): "
@@ -337,11 +362,9 @@ def detect(tree, source: bytes) -> List[Dict[str, Any]]:
 
         method = get_method_name(node)
 
-        # skip transaction locks
         if chain_has_lock(node):
             continue
 
-        # already has select()/selectRaw()/addSelect() in chain — optimised, skip
         if chain_has_select(node):
             continue
 
@@ -359,8 +382,7 @@ def detect(tree, source: bytes) -> List[Dict[str, Any]]:
                 "title": "SELECT * inside loop — N+1 + full row fetch combined",
                 "description": (
                     f"Eloquent {method}() without select() inside a loop — "
-                    f"fetches ALL columns for N iterations. "
-                    f"Compounds Rule 1 (N queries) and Rule 3 (full row) together."
+                    f"fetches ALL columns for N iterations."
                 ),
                 "suggestion": (
                     "Move the query outside the loop using whereIn(). "
@@ -396,7 +418,6 @@ def detect(tree, source: bytes) -> List[Dict[str, Any]]:
 
         # ── Context 4 — with() present but no select ─────────
         if has_with:
-            # eager load ending with first() → single record → medium not high
             eager_severity = "medium" if method in {"first", "firstOrFail"} else "high"
             eager_weight   = 25 if method in {"first", "firstOrFail"} else 40
             findings.append({
