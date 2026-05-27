@@ -127,8 +127,10 @@ def get_chain_root_class(terminal_node) -> str:
 def collect_chain_method_names(terminal_node) -> List[str]:
     """
     Walk the full method chain and collect ALL method names.
-    Uses BFS on the full subtree to catch methods regardless of
-    nesting depth — fixes lockForUpdate and select(DB::raw()) detection.
+    Uses two passes:
+    1. Primary walk — follow leftmost child chain
+    2. Secondary pass — full subtree scan, collect names after -> operator only
+       (avoids picking up argument values like 'status', 'active')
     """
     names = []
 
@@ -147,15 +149,21 @@ def collect_chain_method_names(terminal_node) -> List[str]:
         else:
             break
 
-    # secondary pass — also scan full subtree text for method names
-    # this catches cases where AST nesting is deeper than expected
-    # e.g. lockForUpdate() nested inside complex chain
+    # secondary pass — full subtree scan
+    # only collect name nodes that appear AFTER -> operator
+    # this precisely catches lockForUpdate(), sharedLock() etc. at any depth
     all_sub = collect_all_nodes(terminal_node)
     for sub in all_sub:
         if sub.type == "member_call_expression":
-            name = get_method_name(sub)
-            if name and name not in names:
-                names.append(name)
+            found_arrow = False
+            for child in sub.children:
+                if child.type == "->":
+                    found_arrow = True
+                elif found_arrow and child.type == "name":
+                    name = child.text.decode("utf-8")
+                    if name and name not in names:
+                        names.append(name)
+                    break  # only one method name per call expression
 
     return names
 
