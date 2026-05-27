@@ -37,6 +37,7 @@ interface Issue {
     line:               number;
     weight:             number;
     severity:           string;
+    severity_note?:     string;
     cost_usd_monthly?:  number;
     cost_inr_monthly?:  number;
     carbon_kg_monthly?: number;
@@ -52,15 +53,17 @@ interface AnalyzeResponse {
     total_operation_weight: number;
     total_cost_usd_monthly?: number;
     total_cost_inr_monthly?: number;
+    runs_per_day?:          number;
+    file_path?:             string;
 }
 
 // ── Constants ─────────────────────────────────────────────────
-const DEFAULT_RUNS_PER_DAY         = 10_000;
+const DEFAULT_RUNS_PER_DAY         = 700;
 const USD_TO_INR                   = 84;
 const RDS_IO_COST_FLOOR_PER_WEIGHT = 0.000002;
 
-function fallbackMonthlyCostUSD(weight: number): number {
-    return weight * RDS_IO_COST_FLOOR_PER_WEIGHT * DEFAULT_RUNS_PER_DAY * 30;
+function fallbackMonthlyCostUSD(weight: number, runsPerDay: number): number {
+    return weight * RDS_IO_COST_FLOOR_PER_WEIGHT * runsPerDay * 30;
 }
 
 // ── Formatting ────────────────────────────────────────────────
@@ -112,7 +115,7 @@ const decorationMedium = vscode.window.createTextEditorDecorationType({
 
 const allDecorations = [decorationVeryHigh, decorationHigh, decorationMedium];
 
-// ── HTTP helper (replaces fetch) ──────────────────────────────
+// ── HTTP helper ───────────────────────────────────────────────
 function postJSON<T>(baseUrl: string, path: string, payload: unknown): Promise<T> {
     return new Promise((resolve, reject) => {
         const body    = JSON.stringify(payload);
@@ -173,24 +176,27 @@ export function activate(context: vscode.ExtensionContext) {
                 return;
             }
 
-            const code = editor.document.getText();
+            const code     = editor.document.getText();
+            const filePath = editor.document.fileName ?? '';
             statusBar.text = '$(sync~spin) Analyzing...';
 
-            // ── Server URL — reads from VSCode settings, defaults to localhost ──
             const config  = vscode.workspace.getConfiguration('greenops');
             const baseUrl = config.get<string>('serverUrl') ?? 'http://localhost:8000';
 
             try {
-                const filePath = editor.document.fileName ?? '';
-                const data = await postJSON<AnalyzeResponse>(baseUrl, '/analyze', { code, file_path: filePath });
+                const data = await postJSON<AnalyzeResponse>(baseUrl, '/analyze', {
+                    code,
+                    file_path: filePath
+                });
 
-                const issueCount = data.issues.length;
-                const score      = Math.round(data.green_score);
+                const issueCount  = data.issues.length;
+                const score       = Math.round(data.green_score);
+                const runsPerDay  = data.runs_per_day ?? DEFAULT_RUNS_PER_DAY;
 
                 // ── Total monthly cost ────────────────────────
                 const totalMonthlyUSD = data.total_cost_usd_monthly
                     ?? data.issues.reduce((sum, i) =>
-                        sum + (i.cost_usd_monthly ?? fallbackMonthlyCostUSD(i.weight)), 0);
+                        sum + (i.cost_usd_monthly ?? fallbackMonthlyCostUSD(i.weight, runsPerDay)), 0);
                 const totalMonthlyINR = totalMonthlyUSD * USD_TO_INR;
 
                 // ── Status bar ────────────────────────────────
@@ -200,9 +206,10 @@ export function activate(context: vscode.ExtensionContext) {
                     `Monthly infra waste: ${fmtINR(totalMonthlyINR)} (${fmtUSD(totalMonthlyUSD)})`,
                     `Carbon: ${fmtCarbon(data.estimated_co2_kg)}/month`,
                     `At 10x scale: ${fmtINR(totalMonthlyINR * 10)}/month`,
+                    `Frequency: ${runsPerDay.toLocaleString()} req/day (auto-detected)`,
                     `Click to re-analyse`,
                 ].join('\n');
-                statusBar.color   = score >= 70 ? '#4ade80' : score >= 40 ? '#facc15' : '#f87171';
+                statusBar.color = score >= 70 ? '#4ade80' : score >= 40 ? '#facc15' : '#f87171';
 
                 vscode.window.showInformationMessage(
                     `GreenOps · Score ${score}/100 · ${fmtINR(totalMonthlyINR)}/month infra waste · ${issueCount} inefficienc${issueCount !== 1 ? 'ies' : 'y'}`
@@ -226,7 +233,7 @@ export function activate(context: vscode.ExtensionContext) {
 
                     // ── Cost figures ──────────────────────────
                     const monthlyUSD = issue.cost_usd_monthly
-                        ?? fallbackMonthlyCostUSD(issue.weight);
+                        ?? fallbackMonthlyCostUSD(issue.weight, runsPerDay);
                     const monthlyINR = monthlyUSD * USD_TO_INR;
                     const annualUSD  = monthlyUSD * 12;
                     const annualINR  = annualUSD * USD_TO_INR;
@@ -236,7 +243,8 @@ export function activate(context: vscode.ExtensionContext) {
                     const proj          = issue.carbon_projections;
 
                     // ── Scaling / tier info ───────────────────
-                    const scaling = issue.cost_breakdown?.scaling;
+                    const scaling  = issue.cost_breakdown?.scaling;
+                    const bd       = issue.cost_breakdown;
 
                     // ── Build hover markdown ──────────────────
                     let hoverLines: string[] = [];
@@ -247,27 +255,56 @@ export function activate(context: vscode.ExtensionContext) {
                     if (issue.is_throughput_degrader) {
                         hoverLines.push(`> ⚡ **Throughput degrader** — no direct AWS bill line, but burns EC2 CPU that could serve other requests`);
                     } else {
-                        hoverLines.push(`> 💸 **Monthly infra waste: ${fmtINR(monthlyINR)}** *(${fmtUSD(monthlyUSD)}) at ${DEFAULT_RUNS_PER_DAY.toLocaleString()} req/day*`);
+                        hoverLines.push(`> 💸 **Monthly infra waste: ${fmtINR(monthlyINR)}** *(${fmtUSD(monthlyUSD)}) at ${runsPerDay.toLocaleString()} req/day*`);
                     }
                     hoverLines.push('');
 
+                    // ── Summary table ─────────────────────────
                     hoverLines.push('| | |');
                     hoverLines.push('|---|---|');
                     hoverLines.push(`| **Severity** | ${issue.severity} |`);
 
+                    // severity note if downgraded
+                    if (issue.severity_note) {
+                        hoverLines.push(`| **Note** | ${issue.severity_note} |`);
+                    }
+
                     if (!issue.is_throughput_degrader) {
                         hoverLines.push(`| **Monthly waste** | ${fmtINR(monthlyINR)} / ${fmtUSD(monthlyUSD)} |`);
                         hoverLines.push(`| **Annual waste** | ${fmtINR(annualINR)} / ${fmtUSD(annualUSD)} |`);
+                        hoverLines.push(`| **Frequency** | ${runsPerDay.toLocaleString()} req/day (auto-detected) |`);
                     }
 
+                    // ── Cost formula breakdown ────────────────
+                    if (bd && !issue.is_throughput_degrader) {
+                        hoverLines.push('');
+                        hoverLines.push('**Cost formula breakdown**');
+                        hoverLines.push('');
+                        hoverLines.push('| Component | Monthly cost |');
+                        hoverLines.push('|---|---|');
+                        hoverLines.push(`| RDS I/O (direct bill) | ${fmtUSD(bd.rds_io_usd)} |`);
+                        if (scaling && scaling.total_scaling_delta_usd > 0) {
+                            hoverLines.push(`| EC2 tier pressure | ${fmtUSD(scaling.ec2_delta_usd)} |`);
+                            hoverLines.push(`| RDS tier pressure | ${fmtUSD(scaling.rds_delta_usd)} |`);
+                        }
+                        hoverLines.push(`| **Total** | **${fmtUSD(bd.total_usd)}** |`);
+                    }
+
+                    // ── Tier pressure ─────────────────────────
                     if (scaling && scaling.total_scaling_delta_usd > 0) {
-                        hoverLines.push(`| **EC2 tier pressure** | ${scaling.efficient_ec2_tier} → ${scaling.degraded_ec2_tier} (+$${scaling.ec2_delta_usd}/mo) |`);
-                        hoverLines.push(`| **RDS tier pressure** | ${scaling.efficient_rds_tier} → ${scaling.degraded_rds_tier} (+$${scaling.rds_delta_usd}/mo) |`);
-                        hoverLines.push(`| **Throughput loss** | ${scaling.throughput_degradation}× more capacity needed |`);
+                        hoverLines.push('');
+                        hoverLines.push('**Instance tier pressure**');
+                        hoverLines.push('');
+                        hoverLines.push('| | Efficient | Degraded |');
+                        hoverLines.push('|---|---|---|');
+                        hoverLines.push(`| EC2 | ${scaling.efficient_ec2_tier} | ${scaling.degraded_ec2_tier} (+$${scaling.ec2_delta_usd}/mo) |`);
+                        hoverLines.push(`| RDS | ${scaling.efficient_rds_tier} | ${scaling.degraded_rds_tier} (+$${scaling.rds_delta_usd}/mo) |`);
+                        hoverLines.push(`| Throughput loss | | ${scaling.throughput_degradation}× more capacity needed |`);
                     }
 
+                    // ── Carbon impact ─────────────────────────
                     hoverLines.push('');
-                    hoverLines.push('**Carbon impact (India CEA 2023 grid · 0.708 kg CO₂/kWh)**');
+                    hoverLines.push('**Carbon impact (India CEA 2023 · 0.708 kg CO₂/kWh)**');
                     hoverLines.push('');
                     hoverLines.push('| Scale | Monthly | Annual |');
                     hoverLines.push('|---|---|---|');
@@ -282,11 +319,12 @@ export function activate(context: vscode.ExtensionContext) {
                         hoverLines.push(`| 100× growth | ${fmtCarbon(carbonMonthly * 100)} | ${fmtCarbon(carbonMonthly * 1200)} |`);
                     }
 
+                    // ── Fix suggestion ────────────────────────
                     hoverLines.push('');
                     hoverLines.push(`💡 **Fix:** ${issue.suggestion}`);
                     hoverLines.push('');
                     hoverLines.push('---');
-                    hoverLines.push('*GreenOps · EC2+RDS ap-south-1 model · SEBI BRSR Scope 3 ready*');
+                    hoverLines.push('*GreenOps · EC2+RDS ap-south-1 · SEBI BRSR Scope 3 ready*');
 
                     const hoverMessage = new vscode.MarkdownString(hoverLines.join('\n'));
                     hoverMessage.isTrusted = true;
