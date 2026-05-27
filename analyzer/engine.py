@@ -19,6 +19,55 @@ from analyzer.utils.severity_modifier import apply as apply_severity_modifier
 # Green score = 100 - (total_weight / MAX_WEIGHT * 100), floored at 0
 MAX_WEIGHT = 300
 
+def get_frequency_from_path(file_path: str) -> int:
+    """
+    Auto-detect realistic runs_per_day from file path.
+    Based on Taxina traffic data: 700 completed rides/day, Mumbai region.
+ 
+    Replaces flat 10k/day hardcode with context-aware frequency.
+    Long term: replace with CloudWatch historical data per endpoint.
+    """
+    path = file_path.lower().replace("\\", "/")
+ 
+    # ── Console scheduled commands ────────────────────────────
+    if "console" in path or "command" in path:
+        if "endinactive" in path:   return 1440   # everyMinute
+        if "split" in path:         return 1      # daily 00:01
+        if "archive" in path:       return 1      # daily 00:10
+        return 24                                  # default hourly
+ 
+    # ── Listeners ─────────────────────────────────────────────
+    if "listener" in path:          return 1400   # ~2 events per ride
+ 
+    # ── Jobs ──────────────────────────────────────────────────
+    if "job" in path:               return 700    # one per completed ride
+ 
+    # ── Admin / Web — low traffic ─────────────────────────────
+    if "admin" in path:             return 50
+    if "/web/" in path:             return 50
+ 
+    # ── API Controllers ───────────────────────────────────────
+    if "auth" in path:              return 200    # login per session
+    if "user" in path:              return 700    # every ride request
+    if "driver" in path:            return 700    # every ride request
+    if "payment" in path:           return 500    # completed rides
+    if "transaction" in path:       return 500    # completed rides
+    if "subscription" in path:      return 200    # driver subscription checks
+    if "outstation" in path:        return 70     # ~10% of rides
+    if "partner" in path:           return 50     # admin level
+    if "bob" in path:               return 500    # BOB payment flow
+ 
+    # ── Helpers / Services / Models ───────────────────────────
+    # inherit dominant calling controller frequency
+    if "helper" in path:            return 700
+    if "service" in path:           return 700
+    if "model" in path:             return 700
+    if "repository" in path:        return 700
+    if "trait" in path:             return 700
+    if "scope" in path:             return 700
+ 
+    # ── Default ───────────────────────────────────────────────
+    return 700
 
 def compute_green_score(total_weight: int) -> int:
     score = 100 - int((total_weight / MAX_WEIGHT) * 100)
