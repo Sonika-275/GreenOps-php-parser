@@ -11,12 +11,12 @@ Contexts detected:
 False positive guards:
   - Non-DB facades excluded via facade_exclusions.py
   - DB::table() query builder chains excluded from static model call detection
+  - lockForUpdate() / sharedLock() / lockForShare() → intentional locks, skip
 """
 
 from typing import List, Dict, Any
-from analyzer.utils.facade_exclusions import is_non_db_facade
+from analyzer.utils.facade_exclusions import is_non_db_facade, chain_has_lock
 
-# Eloquent methods that execute a query (terminal methods)
 ELOQUENT_TERMINAL_METHODS = {
     "get", "find", "first", "all", "paginate",
     "firstOrFail", "findOrFail", "findMany",
@@ -25,7 +25,6 @@ ELOQUENT_TERMINAL_METHODS = {
     "min", "max", "latest", "oldest",
 }
 
-# Static Eloquent entry points — Class::method()
 ELOQUENT_STATIC_METHODS = {
     "find", "findMany", "findOrFail", "first",
     "firstOrFail", "all", "get", "where",
@@ -36,14 +35,10 @@ ELOQUENT_STATIC_METHODS = {
 
 LOOP_TYPES = {"foreach_statement", "for_statement", "while_statement"}
 
-# Query builder root — DB::table() is not Eloquent, exclude from R1
 DB_QUERY_BUILDER_ROOT = "DB"
 
 
-# ── AST Traversal Helpers ────────────────────────────────────
-
 def get_ancestors(node) -> List:
-    """Walk up the AST and return all ancestor nodes."""
     ancestors = []
     current = node.parent
     while current is not None:
@@ -53,7 +48,6 @@ def get_ancestors(node) -> List:
 
 
 def is_inside_loop(node) -> bool:
-    """Check if node is inside any loop."""
     for ancestor in get_ancestors(node):
         if ancestor.type in LOOP_TYPES:
             return True
@@ -61,7 +55,6 @@ def is_inside_loop(node) -> bool:
 
 
 def get_enclosing_loop(node):
-    """Return the immediate enclosing loop node, or None."""
     for ancestor in get_ancestors(node):
         if ancestor.type in LOOP_TYPES:
             return ancestor
@@ -69,7 +62,6 @@ def get_enclosing_loop(node):
 
 
 def is_inside_nested_loop(node) -> bool:
-    """Check if node is inside at least two nested loops."""
     loop_count = 0
     for ancestor in get_ancestors(node):
         if ancestor.type in LOOP_TYPES:
@@ -80,7 +72,6 @@ def is_inside_nested_loop(node) -> bool:
 
 
 def is_inside_function(node) -> bool:
-    """Check if node is inside a function/method definition."""
     for ancestor in get_ancestors(node):
         if ancestor.type in {
             "function_definition",
@@ -97,17 +88,10 @@ def get_node_text(node, source: bytes) -> str:
 
 
 def get_line(node) -> int:
-    return node.start_point[0] + 1  # 1-indexed
+    return node.start_point[0] + 1
 
-
-# ── Chain Analysis ────────────────────────────────────────────
 
 def get_chain_root_class(node) -> str:
-    """
-    Walk to the root of the call chain and return the class name.
-    e.g. DB::table()->where()->get() → 'DB'
-         User::where()->get()        → 'User'
-    """
     current = node
     while current is not None:
         if current.type == "scoped_call_expression":
@@ -124,10 +108,6 @@ def get_chain_root_class(node) -> str:
 
 
 def get_method_chain_names(node, source: bytes) -> List[str]:
-    """
-    Walk up member_call_expression chain and collect all method names.
-    e.g. User::where()->with()->get() → ['where', 'with', 'get']
-    """
     names = []
     current = node
     while current is not None:
@@ -145,12 +125,6 @@ def get_method_chain_names(node, source: bytes) -> List[str]:
 
 
 def is_relationship_call(node, source: bytes) -> bool:
-    """
-    Detect: $model->relationship()->get()
-    Pattern: member_call_expression → member_call_expression
-    The outer call ends with an Eloquent terminal.
-    The inner call is on a variable (not Class::).
-    """
     if node.type != "member_call_expression":
         return False
 
@@ -177,11 +151,6 @@ def is_relationship_call(node, source: bytes) -> bool:
 
 
 def is_static_model_call(node, source: bytes) -> bool:
-    """
-    Detect: Model::find($id), Model::where()->get() inside loop.
-    Excludes DB::table() query builder chains — not Eloquent.
-    """
-    # exclude DB::table() query builder
     if get_chain_root_class(node) == DB_QUERY_BUILDER_ROOT:
         return False
 
@@ -209,10 +178,7 @@ def is_static_model_call(node, source: bytes) -> bool:
     return False
 
 
-# ── Main Traversal ────────────────────────────────────────────
-
 def collect_all_nodes(root) -> List:
-    """BFS collect all nodes in tree."""
     result = []
     queue = [root]
     while queue:
@@ -233,8 +199,12 @@ def detect(tree, source: bytes) -> List[Dict[str, Any]]:
         if line in seen_lines:
             continue
 
-        # skip non-DB facade calls (Cache, Session, Redis, Http, File etc.)
+        # skip non-DB facade calls
         if is_non_db_facade(node, source):
+            continue
+
+        # skip transaction lock patterns — intentional DB locking
+        if chain_has_lock(node):
             continue
 
         # ── Check relationship call ($var->rel()->get()) ──────

@@ -21,13 +21,14 @@ False positive guards:
 """
 
 from typing import List, Dict, Any
-from analyzer.utils.facade_exclusions import is_non_db_facade
+from analyzer.utils.facade_exclusions import is_non_db_facade, chain_has_lock
 
 TERMINAL_METHODS = {"get", "all", "first", "paginate", "firstOrFail", "findOrFail"}
 
 QB_TERMINAL_METHODS = {"get", "first", "firstOrFail"}
 
-# Transaction lock methods — intentional, never flag
+# Transaction lock methods now in facade_exclusions.py — shared with R1
+# LOCK_METHODS kept here for reference only
 LOCK_METHODS = {"lockForUpdate", "sharedLock", "lockForShare"}
 
 # Valid select patterns — if ANY present in chain, query is already optimised
@@ -188,15 +189,6 @@ def chain_has_select(terminal_node) -> bool:
         pass
 
     return False
-
-
-def chain_has_lock(terminal_node) -> bool:
-    """
-    Check if chain contains a transaction lock method.
-    Uses full subtree scan to catch lockForUpdate() at any nesting depth.
-    """
-    chain = collect_chain_method_names(terminal_node)
-    return bool(LOCK_METHODS & set(chain))
 
 
 def chain_has_with(terminal_node) -> bool:

@@ -204,3 +204,34 @@ def is_non_db_facade(node, source: bytes) -> bool:
     if root_name and root_name in NON_DB_FACADES:
         return True
     return False
+
+
+# ── Transaction lock detection (shared across R1 and R3) ─────
+
+LOCK_METHODS = {"lockForUpdate", "sharedLock", "lockForShare"}
+
+
+def chain_has_lock(node) -> bool:
+    """
+    Check if the call chain contains a transaction lock method.
+    Works by scanning all member_call_expression nodes in the subtree
+    and collecting method names that appear after the -> operator.
+
+    Used by R1 and R3 to suppress false positives on intentional locks.
+    e.g. Model::where()->lockForUpdate()->first() → skip
+    """
+    queue = [node]
+    while queue:
+        current = queue.pop(0)
+        if current.type == "member_call_expression":
+            found_arrow = False
+            for child in current.children:
+                if child.type == "->":
+                    found_arrow = True
+                elif found_arrow and child.type == "name":
+                    name = child.text.decode("utf-8")
+                    if name in LOCK_METHODS:
+                        return True
+                    break
+        queue.extend(current.children)
+    return False
